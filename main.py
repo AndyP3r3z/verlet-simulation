@@ -294,11 +294,32 @@ class Box:
 # Parámetros y setup
 # ---------------------------
 
+def graph_params_evolution(timestep: float, **kwargs: list[float]) -> None:
+    """Creates a graph with the parameter evolutions given."""
+    labels: list[str] = list(kwargs.keys())
+    n: int = len(kwargs)
+    length: int = len(next(iter(kwargs.values())))
+    t: np.ndarray = np.arange(length)*timestep
+    _, axes = plt.subplots(n, 1, sharex=True, figsize=(8, 2.5*n))
+    if n == 1: axes = [axes]
+    colors: list[str] = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    for ax, lbl, color in zip(axes, labels, colors):
+        ax.plot(t, kwargs[lbl], color=color)
+        ax.legend([lbl])
+        ax.grid(True)
+    axes[-1].set_xlabel("Time")
+    plt.tight_layout()
+    plt.show()
+    return
+
 def main() -> None:
     # Parámetros
-    radio = 3
     N = 15
     particle_radius = 0.5
+    # A mayor `k`, mayor será el área total en relación con el área ocupada con
+    # las esferas (se verá más vacío).
+    k: float = 4
+    radio = math.sqrt(k*N)*particle_radius # cálculo del radio del contenedor
     min_dist = 1.8 * particle_radius  # separación inicial
     dt = 0.002
 
@@ -331,7 +352,7 @@ def main() -> None:
         box.particles[i].ax = ax0
         box.particles[i].ay = ay0
 
-    # Opcional: reescalar velocidades para una temperatura inicial aproximada
+    # Reescalar velocidades para una temperatura inicial aproximada
     # (para empezar más frío o más caliente)
     def set_initial_temperature(box_obj, T_target):
         # calcula T actual
@@ -371,13 +392,24 @@ def main() -> None:
     frames = 20000
     steps_per_frame = 1
 
+    energies: list[float] = []
+    potentials: list[float] = []
+    temperatures: list[float] = []
+    r_mins: list[float] = []
+
     def animate(frame):
         for _ in range(steps_per_frame):
             box.simulate_step()
 
         E_total, K, U = box.total_energy()
         T_inst = box.compute_temperature()
-        temp_text.set_text(f"T={T_inst:.4f}  E={E_total:.4f}")
+        parameter = box.average_min_distance()
+        energies.append(E_total)
+        potentials.append(U)
+        temperatures.append(T_inst)
+        r_mins.append(parameter)
+
+        temp_text.set_text(f"T={T_inst:.4f}  E={E_total:.4f}\nr_min = {parameter:.4f}")
 
         for artist, p in zip(particle_artists, box.particles):
             artist.set_center((p.x, p.y))
@@ -386,5 +418,12 @@ def main() -> None:
 
     ani = FuncAnimation(fig, animate, frames=frames, interval=20, blit=False)
     plt.show()
+
+    graph_params_evolution(
+        dt,
+        E=energies,
+        U=potentials,
+        T=temperatures,
+        r_min=r_mins)
 
 if __name__ == "__main__": main()
