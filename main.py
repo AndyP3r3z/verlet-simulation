@@ -64,6 +64,10 @@ class Particle:
         self.ax = 0.0
         self.ay = 0.0
 
+    def __sub__(self, other):
+        """Calculates the distance between this and another particle."""
+        return math.sqrt( ((self.x - other.x)**2) + ((self.y - other.y)**2) )
+
 # ---------------------------
 # Caja con LJ, Verlet y Berendsen
 # ---------------------------
@@ -84,6 +88,29 @@ class Box:
 
     def add_particle(self, p: Particle):
         self.particles.append(p)
+
+    def average_min_distance(self) -> float:
+        """Calculates the average minimum distance between all particles."""
+        distances: list[list[float]] = []
+        mins: list[float] = []
+        n_particles: int = len(self.particles)
+        # Populate the distances list.
+        for i, particle in enumerate(self.particles):
+            all_distances: list[float] = [
+                particle - self.particles[j]
+                # Calculates distances without repetitions.
+                for j in range(i+1, n_particles)]
+            distances.append(all_distances)
+        # Populate the mins.
+        for i, diffs in enumerate(distances):
+            # Appends previous calculated distances to min.
+            to_append: list[float] = [
+                distances[j][i-j-1]
+                for j in range(i)]
+            # Calculates the min.
+            mins.append(min(diffs+to_append))
+        # Returns average.
+        return sum(mins)/len(mins)
 
     # Fuerza LJ entre pares (componentes)
     def lj_force_components(self, dx, dy, r):
