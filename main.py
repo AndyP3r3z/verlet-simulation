@@ -79,7 +79,7 @@ class Box:
         self.epsilon = epsilon
         self.cutoff = cutoff
         self.T0 = T0
-        
+
         # Parámetros para ambos termostatos
         self.gamma = gamma  # Para Langevin (Fricción)
         self.tau = tau      # Para Berendsen (Tiempo de relajación)
@@ -104,7 +104,7 @@ class Box:
                 mins.append(min(full_list))
             else:
                 mins.append(0.0)
-        
+
         if not mins: return 0.0
         return sum(mins)/len(mins)
 
@@ -114,14 +114,14 @@ class Box:
         """
         N = len(self.particles)
         if N == 0: return []
-        
+
         # 1. Preparar datos (Numpy)
         pos = np.array([[p.x, p.y] for p in self.particles])
         vel = np.array([[p.vx, p.vy] for p in self.particles])
         masses = np.array([p.m for p in self.particles]).reshape(-1, 1)
 
         # 2. Matriz de distancias
-        diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :] 
+        diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
         r2 = np.sum(diff**2, axis=-1)
         np.fill_diagonal(r2, np.inf) # Evitar división por cero
 
@@ -134,24 +134,24 @@ class Box:
         inv_r2[mask] = 1.0 / r2[mask]
         sr2 = (self.sigma**2) * inv_r2
         sr6 = sr2 ** 3
-        
+
         # F = 24 * eps * inv_r2 * sr6 * (2*sr6 - 1)
         factor = (24.0 * self.epsilon * inv_r2) * sr6 * (2.0 * sr6 - 1.0)
         f_matrix = factor[:, :, np.newaxis] * diff
         f_conservative = np.sum(f_matrix, axis=1)
 
         #--------------------------- Elección del termostato--------------------------------
-        
+
         # --- OPCION A: LANGEVIN (Descomentar para usar) ---
         dt = self.particles[0].dt
         noise_std = np.sqrt(2.0 * self.T0 * self.gamma * masses / dt)
         f_random = noise_std * np.random.normal(size=(N, 2))
-        f_drag = -self.gamma * vel 
+        f_drag = -self.gamma * vel
         f_total = f_conservative + f_drag + f_random
-        
+
         # --- OPCION B: SOLO LJ (Para usar Berendsen o NVE) ---
         # Si usas Berendsen, comenta las 4 lineas de arriba (Option A) y descomenta esta:
-        # f_total = f_conservative 
+        # f_total = f_conservative
 
         acc_array = f_total / masses
         return [tuple(a) for a in acc_array]
@@ -194,7 +194,7 @@ class Box:
         for p in self.particles:
             p.x += p.vx * dt + 0.5 * p.ax * dt * dt
             p.y += p.vy * dt + 0.5 * p.ay * dt * dt
-        
+
         # 2. Colisión Pared
         for p in self.particles: self.apply_box_collision_position_fix(p)
 
@@ -213,11 +213,11 @@ class Box:
 
         # --- OPCION A: LANGEVIN ---
         # Si usas Langevin, NO descomentes Berendsen.
-        pass 
+        pass
 
         # --- OPCION B: BERENDSEN (Descomentar para usar) ---
-        # self.apply_berendsen() 
-        
+        # self.apply_berendsen()
+
     def total_energy(self):
         K = sum(0.5 * p.m * (p.vx**2 + p.vy**2) for p in self.particles)
         U = 0.0
@@ -233,6 +233,73 @@ class Box:
                 inv_r6 = inv_r ** 6
                 U += 4 * self.epsilon * (inv_r6**2 - inv_r6)
         return K + U, K, U
+
+
+# Análisis de la red cristalina: g(r), vecinos, orden hexagonal
+
+def compute_radial_distribution(particles, Rmax=None, nbins=200):
+
+    N = len(particles)
+    pos = np.array([[p.x, p.y] for p in particles])
+
+    diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+    r2 = np.sum(diff ** 2, axis=-1)
+    r = np.sqrt(r2)
+
+    dists = r[np.triu_indices(N, 1)]
+
+    if Rmax is None:
+        Rmax = np.max(dists)
+
+    hist, edges = np.histogram(dists, bins=nbins, range=(0, Rmax))
+    r_vals = 0.5 * (edges[1:] + edges[:-1])
+
+    area_shell = np.pi * (edges[1:] ** 2 - edges[:-1] ** 2)
+    density = N / (np.pi * (Rmax ** 2))
+
+    g_r = hist / (area_shell * density * N)
+    return r_vals, g_r
+
+def compute_coordination_numbers(particles, cutoff=1.5):
+
+    N = len(particles)
+    pos = np.array([[p.x, p.y] for p in particles])
+
+    diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+    r = np.sqrt(np.sum(diff ** 2, axis=-1))
+    np.fill_diagonal(r, np.inf)
+
+    neighbors = np.sum(r < cutoff, axis=1)
+    return neighbors
+
+def compute_hexagonal_order(particles, cutoff=1.5):
+
+    N = len(particles)
+    pos = np.array([[p.x, p.y] for p in particles])
+
+    diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+    r = np.sqrt(np.sum(diff ** 2, axis=-1))
+    np.fill_diagonal(r, np.inf)
+
+    psi6_list = []
+
+    for i in range(N):
+        neigh_idx = np.where(r[i] < cutoff)[0]
+        if len(neigh_idx) == 0:
+            psi6_list.append(0)
+            continue
+
+        angles = []
+        for j in neigh_idx:
+            dx, dy = diff[i, j]
+            theta = np.arctan2(dy, dx)
+            angles.append(theta)
+
+        exp_vals = np.exp(1j * 6 * np.array(angles))
+        psi6_list.append(np.mean(exp_vals))
+
+    psi6_total = np.mean(psi6_list)
+    return psi6_total
 
 
 
@@ -274,7 +341,7 @@ def main() -> None:
 
     # Termostato
     T0 = 0.05   # temperatura objetivo (baja)
-    gamma = 5.0  # coeficiente de fricción para Langevin 
+    gamma = 5.0  # coeficiente de fricción para Langevin
     #gamma bajo = más agitado, gamma alto = más viscoso
 
     # tau = 1.0   # tiempo de acoplamiento (mayor = más lento) Brandensen
@@ -373,5 +440,23 @@ def main() -> None:
         U=potentials,
         T=temperatures,
         r_min=r_mins)
+
+    print("\n -+- Análisis de red cristalina -+-\n")
+
+    r_vals, g_r = compute_radial_distribution(box.particles)
+    plt.figure()
+    plt.plot(r_vals, g_r)
+    plt.title("Función de distribución radial g(r)")
+    plt.xlabel("r")
+    plt.ylabel("g(r)")
+    plt.grid()
+    plt.show()
+
+    neighbors = compute_coordination_numbers(box.particles)
+    print(f"Número medio de vecinos: {np.mean(neighbors):.3f}")
+
+    psi6 = compute_hexagonal_order(box.particles)
+    print(f"Orden hexagonal psi6 = {abs(psi6):.4f}")
+
 
 if __name__ == "__main__": main()
