@@ -69,230 +69,174 @@ class Particle:
         return math.sqrt( ((self.x - other.x)**2) + ((self.y - other.y)**2) )
 
 # ---------------------------
-# Caja con LJ, Verlet y Berendsen
+# Caja con LJ, Verlet, Berendsen o Langevin
 # ---------------------------
 class Box:
-    def __init__(self, radio, sigma=1.0, epsilon=1.0, cutoff=None, T0=0.1, tau=0.5):
+    def __init__(self, radio, sigma=1.0, epsilon=1.0, cutoff=None, T0=0.1, gamma=5.0, tau=0.5):
         self.radio = radio
         self.particles = []
-
-        # Lennard-Jones params
         self.sigma = sigma
         self.epsilon = epsilon
-        # cutoff en unidades de distancia
         self.cutoff = cutoff
-
-        # Termostato
         self.T0 = T0
-        self.tau = tau
+        
+        # Parámetros para ambos termostatos
+        self.gamma = gamma  # Para Langevin (Fricción)
+        self.tau = tau      # Para Berendsen (Tiempo de relajación)
 
     def add_particle(self, p: Particle):
         self.particles.append(p)
 
     def average_min_distance(self) -> float:
-        """Calculates the average minimum distance between all particles."""
-        distances: list[list[float]] = []
-        mins: list[float] = []
-        n_particles: int = len(self.particles)
-        # Populate the distances list.
+        """Calcula la distancia mínima promedio (necesario para las gráficas)."""
+        distances = []
+        mins = []
+        n_particles = len(self.particles)
+        # Poblar lista de distancias
         for i, particle in enumerate(self.particles):
-            all_distances: list[float] = [
-                particle - self.particles[j]
-                # Calculates distances without repetitions.
-                for j in range(i+1, n_particles)]
+            all_distances = [particle - self.particles[j] for j in range(i+1, n_particles)]
             distances.append(all_distances)
-        # Populate the mins.
+        # Calcular mínimos
         for i, diffs in enumerate(distances):
-            # Appends previous calculated distances to min.
-            to_append: list[float] = [
-                distances[j][i-j-1]
-                for j in range(i)]
-            # Calculates the min.
-            mins.append(min(diffs+to_append))
-        # Returns average.
+            to_append = [distances[j][i-j-1] for j in range(i)]
+            full_list = diffs + to_append
+            if full_list:
+                mins.append(min(full_list))
+            else:
+                mins.append(0.0)
+        
+        if not mins: return 0.0
         return sum(mins)/len(mins)
-
-    # Fuerza LJ entre pares (componentes)
-    def lj_force_components(self, dx, dy, r):
-        """Devuelve Fx, Fy (sin dividir por masa). Maneja r->0 con un pequeño eps."""
-        if r == 0:
-            return 0.0, 0.0
-        if (self.cutoff is not None) and (r > self.cutoff):
-            return 0.0, 0.0
-
-        sigma = self.sigma
-        eps = self.epsilon
-
-        inv_r = 1.0 / r
-        inv_r6 = (sigma * inv_r) ** 6
-        inv_r12 = inv_r6 * inv_r6
-        # Magnitud de la fuerza (derivada de LJ)
-        F = 24 * eps * (2 * inv_r12 - inv_r6) * inv_r
-        Fx = F * dx
-        Fy = F * dy
-        return Fx, Fy
 
     def compute_forces(self):
         """
-        Calcula fuerzas y devuelve lista de aceleraciones (ax, ay) para cada partícula.
-        Uso O(N^2) simple.
+        Calcula fuerzas vectorizadas. Puede usar Langevin o solo LJ conservativo.
         """
         N = len(self.particles)
-        accs = [(0.0, 0.0)] * N  # lista de tuplas (ax, ay), se llenará
+        if N == 0: return []
+        
+        # 1. Preparar datos (Numpy)
+        pos = np.array([[p.x, p.y] for p in self.particles])
+        vel = np.array([[p.vx, p.vy] for p in self.particles])
+        masses = np.array([p.m for p in self.particles]).reshape(-1, 1)
 
-        # Inicializa acumuladores
-        fx = np.zeros(N)
-        fy = np.zeros(N)
+        # 2. Matriz de distancias
+        diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :] 
+        r2 = np.sum(diff**2, axis=-1)
+        np.fill_diagonal(r2, np.inf) # Evitar división por cero
 
-        for i in range(N):
-            pi = self.particles[i]
-            for j in range(i + 1, N):
-                pj = self.particles[j]
+        # 3. Fuerzas LJ (Conservativas)
+        mask = np.ones_like(r2, dtype=bool)
+        if self.cutoff is not None:
+            mask = r2 < self.cutoff**2
 
-                dx = pi.x - pj.x
-                dy = pi.y - pj.y
-                r2 = dx * dx + dy * dy
-                if r2 == 0:
-                    continue
-                r = math.sqrt(r2)
+        inv_r2 = np.zeros_like(r2)
+        inv_r2[mask] = 1.0 / r2[mask]
+        sr2 = (self.sigma**2) * inv_r2
+        sr6 = sr2 ** 3
+        
+        # F = 24 * eps * inv_r2 * sr6 * (2*sr6 - 1)
+        factor = (24.0 * self.epsilon * inv_r2) * sr6 * (2.0 * sr6 - 1.0)
+        f_matrix = factor[:, :, np.newaxis] * diff
+        f_conservative = np.sum(f_matrix, axis=1)
 
-                Fx, Fy = self.lj_force_components(dx, dy, r)
+        #--------------------------- Elección del termostato--------------------------------
+        
+        # --- OPCION A: LANGEVIN (Descomentar para usar) ---
+        dt = self.particles[0].dt
+        noise_std = np.sqrt(2.0 * self.T0 * self.gamma * masses / dt)
+        f_random = noise_std * np.random.normal(size=(N, 2))
+        f_drag = -self.gamma * vel 
+        f_total = f_conservative + f_drag + f_random
+        
+        # --- OPCION B: SOLO LJ (Para usar Berendsen o NVE) ---
+        # Si usas Berendsen, comenta las 4 lineas de arriba (Option A) y descomenta esta:
+        # f_total = f_conservative 
 
-                fx[i] += Fx
-                fy[i] += Fy
-                fx[j] -= Fx
-                fy[j] -= Fy
-
-        for i in range(N):
-            ax = fx[i] / self.particles[i].m
-            ay = fy[i] / self.particles[i].m
-            accs[i] = (ax, ay)
-
-        return accs
-
-    def apply_box_collision_position_fix(self, p: Particle):
-        """Coloca la partícula justo en la frontera si sobrepasa (después de mover)."""
-        dist_sq = p.x * p.x + p.y * p.y
-        limit_sq = (self.radio - p.r) ** 2
-        if dist_sq >= limit_sq:
-            dist = math.sqrt(dist_sq) if dist_sq > 0 else 1e-12
-            nx = p.x / dist
-            ny = p.y / dist
-            # reposicionar en la frontera
-            p.x = (self.radio - p.r) * nx
-            p.y = (self.radio - p.r) * ny
-            # reflejar velocidad normal (conservativo)
-            vn = p.vx * nx + p.vy * ny
-            p.vx -= 2 * vn * nx
-            p.vy -= 2 * vn * ny
-
-    def compute_temperature(self):
-        """Temperatura instantánea proporcional a velocidad cuadrática (k_B=1). 2D."""
-        v2 = 0.0
-        for p in self.particles:
-            v2 += p.vx * p.vx + p.vy * p.vy
-        if len(self.particles) == 0:
-            return 0.0
-        # T = <v^2> / (2) in 2D? We use T = (1/(2N)) sum m v^2 with m=1.
-        T = v2 / (2.0 * len(self.particles))
-        return T
+        acc_array = f_total / masses
+        return [tuple(a) for a in acc_array]
 
     def apply_berendsen(self):
-        """Reescalado de velocidades para alcanzar self.T0 con tiempo tau."""
+        """Termostato de Berendsen (Reescalado de velocidades)."""
         T = self.compute_temperature()
-        if T <= 0:
-            return
+        if T <= 0: return
         dt = self.particles[0].dt
         lam = math.sqrt(max(0.0, 1.0 + (dt / self.tau) * (self.T0 / T - 1.0)))
         for p in self.particles:
             p.vx *= lam
             p.vy *= lam
 
-    def simulate_step(self):
-        """
-        Un paso de Velocity-Verlet completo:
-         1) mover posiciones usando a(t)
-         2) aplicar corrección si sale de caja (posición)
-         3) calcular a(t+dt)
-         4) actualizar velocidades usando (a(t)+a(t+dt))/2
-         5) aplicar termostato (Berendsen)
-        """
-        N = len(self.particles)
-        if N == 0:
-            return
+    def apply_box_collision_position_fix(self, p: Particle):
+        """Corrección de posición en la frontera circular."""
+        dist_sq = p.x * p.x + p.y * p.y
+        limit_sq = (self.radio - p.r) ** 2
+        if dist_sq >= limit_sq:
+            dist = math.sqrt(dist_sq) if dist_sq > 0 else 1e-12
+            nx = p.x / dist; ny = p.y / dist
+            p.x = (self.radio - p.r) * nx
+            p.y = (self.radio - p.r) * ny
+            vn = p.vx * nx + p.vy * ny
+            p.vx -= 2 * vn * nx
+            p.vy -= 2 * vn * ny
 
-        # 0) guardar aceleraciones actuales como a_old
+    def compute_temperature(self):
+        v2 = sum(p.vx**2 + p.vy**2 for p in self.particles)
+        if not self.particles: return 0.0
+        return v2 / (2.0 * len(self.particles))
+
+    def simulate_step(self):
+        N = len(self.particles)
+        if N == 0: return
+        dt = self.particles[0].dt
         a_old = [(p.ax, p.ay) for p in self.particles]
 
-        dt = self.particles[0].dt
-
-        # 1) actualizar posiciones
+        # 1. Verlet: Posición
         for p in self.particles:
             p.x += p.vx * dt + 0.5 * p.ax * dt * dt
             p.y += p.vy * dt + 0.5 * p.ay * dt * dt
+        
+        # 2. Colisión Pared
+        for p in self.particles: self.apply_box_collision_position_fix(p)
 
-        # 2) corregir posiciones que salieron del contenedor (colisión posicional)
-        for p in self.particles:
-            self.apply_box_collision_position_fix(p)
+        # 3. Verlet: Fuerzas (Langevin entra aquí si está activo)
+        accs = self.compute_forces()
+        for i, (ax, ay) in enumerate(accs):
+            self.particles[i].ax = ax
+            self.particles[i].ay = ay
 
-        # 3) calcular nuevas aceleraciones a_new
-        accs = self.compute_forces()  # lista de (ax, ay)
-        for i, (ax_new, ay_new) in enumerate(accs):
-            self.particles[i].ax = ax_new
-            self.particles[i].ay = ay_new
-
-        # 4) actualizar velocidades usando promedio de aceleraciones
+        # 4. Verlet: Velocidad
         for i, p in enumerate(self.particles):
-            ax_old, ay_old = a_old[i]
-            p.vx += 0.5 * (ax_old + p.ax) * dt
-            p.vy += 0.5 * (ay_old + p.ay) * dt
+            p.vx += 0.5 * (a_old[i][0] + p.ax) * dt
+            p.vy += 0.5 * (a_old[i][1] + p.ay) * dt
 
-        # 5) Después de actualizar velocidades, también aplicar colisión por frontera
-        # (ya hicimos corrección posicional; aquí solo por si la velocidad las empuja)
-        for p in self.particles:
-            # Si la posición está correcta, reflejar la velocidad si está saliendo
-            dist = math.sqrt(p.x * p.x + p.y * p.y)
-            if dist > (self.radio - p.r) - 1e-12:
-                nx = p.x / dist
-                ny = p.y / dist
-                vn = p.vx * nx + p.vy * ny
-                if vn > 0:  # si se mueve hacia afuera, reflejar
-                    p.vx -= 2 * vn * nx
-                    p.vy -= 2 * vn * ny
+        # ----- ----Velocidades para el termostato ----------
 
-        # 6) aplicar termostato Berendsen (opcional según configuración)
-        self.apply_berendsen()
+        # --- OPCION A: LANGEVIN ---
+        # Si usas Langevin, NO descomentes Berendsen.
+        pass 
 
+        # --- OPCION B: BERENDSEN (Descomentar para usar) ---
+        # self.apply_berendsen() 
+        
     def total_energy(self):
-        """Energía cinética + potencial LJ aproximada."""
-        # Cinética
-        K = 0.0
-        for p in self.particles:
-            K += 0.5 * p.m * (p.vx * p.vx + p.vy * p.vy)
-        # Potencial
+        K = sum(0.5 * p.m * (p.vx**2 + p.vy**2) for p in self.particles)
         U = 0.0
         N = len(self.particles)
+        # Cálculo simple de potencial para las gráficas
         for i in range(N):
             for j in range(i + 1, N):
-                pi = self.particles[i]
-                pj = self.particles[j]
-                dx = pi.x - pj.x
-                dy = pi.y - pj.y
+                pi = self.particles[i]; pj = self.particles[j]
+                dx = pi.x - pj.x; dy = pi.y - pj.y
                 r = math.hypot(dx, dy)
-                if r == 0:
-                    continue
-                sigma = self.sigma
-                eps = self.epsilon
-                inv_r = sigma / r
+                if r == 0: continue
+                inv_r = self.sigma / r
                 inv_r6 = inv_r ** 6
-                inv_r12 = inv_r6 * inv_r6
-                U += 4 * eps * (inv_r12 - inv_r6)
+                U += 4 * self.epsilon * (inv_r6**2 - inv_r6)
         return K + U, K, U
 
 
-# ---------------------------
-# Parámetros y setup
-# ---------------------------
+
+# ---------------------------Parámetros y setup---------------------------
 
 def graph_params_evolution(timestep: float, **kwargs: list[float]) -> None:
     """Creates a graph with the parameter evolutions given."""
@@ -314,7 +258,7 @@ def graph_params_evolution(timestep: float, **kwargs: list[float]) -> None:
 
 def main() -> None:
     # Parámetros
-    N = 15
+    N = 100  # número de partículas
     particle_radius = 0.5
     # A mayor `k`, mayor será el área total en relación con el área ocupada con
     # las esferas (se verá más vacío).
@@ -330,10 +274,13 @@ def main() -> None:
 
     # Termostato
     T0 = 0.05   # temperatura objetivo (baja)
-    tau = 1.0   # tiempo de acoplamiento (mayor = más lento)
+    gamma = 5.0  # coeficiente de fricción para Langevin 
+    #gamma bajo = más agitado, gamma alto = más viscoso
+
+    # tau = 1.0   # tiempo de acoplamiento (mayor = más lento) Brandensen
 
     # Crear caja
-    box = Box(radio=radio, sigma=sigma, epsilon=epsilon, cutoff=cutoff, T0=T0, tau=tau)
+    box = Box(radio=radio, sigma=sigma, epsilon=epsilon, cutoff=cutoff, T0=T0, gamma=gamma) #Quitar gamma si se deasea utilizar Brendensen en vz de Langevin
 
     # Generar posiciones iniciales sin solapamientos
     positions = generate_non_overlapping_positions(N=N, R=radio, min_dist=min_dist)
@@ -374,7 +321,8 @@ def main() -> None:
     ax.set_xlim(-radio, radio)
     ax.set_ylim(-radio, radio)
     ax.set_aspect('equal')
-    ax.set_title("Lennard-Jones + Velocity-Verlet + Berendsen (local)")
+    # ax.set_title("Lennard-Jones + Velocity-Verlet + Berendsen (local)")
+    ax.set_title("Lennard-Jones + Velocity-Verlet + Langevin")
 
     # dibujar frontera circular
     container = plt.Circle((0, 0), radio, fill=False, color='black', lw=1.2)
